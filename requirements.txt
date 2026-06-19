@@ -1,0 +1,17 @@
+# Runtime dependency for the headroom-json-compress plugin.
+#
+# Bare install — the JSON compression path is the Rust _core.abi3.so and loads
+# ZERO torch/transformers. Do NOT add ML extras here.
+#
+# PIN IS CACHE-AFFECTING: a version bump can change the compressed bytes, which
+# breaks prompt-cache prefix stability. Treat any upgrade as a re-validation
+# event — re-run the determinism + multi-turn cache-invariant gates before
+# bumping.
+#
+# Hermes does NOT auto-install plugin requirements. Install manually into the
+# Hermes venv. If your venv has no pip, use uv:
+#
+#     uv pip install --python /path/to/.hermes/hermes-agent/venv/bin/python -r requirements.txt
+#
+# Re-run this after any `hermes update` that rebuilds the venv.
+headroom-ai==0.26.0

@@ -1,0 +1,5 @@
+name: headroom-json-compress
+version: "0.1.0"
+description: "Losslessly compress confidently-structured JSON tool results before they enter the model's context, via the transform_tool_result hook. Reformats indented JSON arrays/objects into Headroom's compact table-schema form (header + rows) — ~55-73% byte reduction, zero rows dropped (verified 301/301, 402/402 in POC). Compresses each result exactly once at append time then freezes it into history (never re-compressed), preserving prompt-cache byte-stability. Gated to an allow-list of structured-output tools (default: search_files), JSON-only, above a size floor, fail-open to raw on any error. OFF by default — enable with HERMES_HEADROOM_JSON_COMPRESS=1. Requires headroom-ai==0.26.0 (bare install, no ML extras)."
+hooks:
+  - transform_tool_result
