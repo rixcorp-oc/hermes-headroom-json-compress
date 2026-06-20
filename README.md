@@ -99,6 +99,28 @@ didn't compress (`not-json`, `below-size-floor`, `not-smaller`), which tells
 you whether a tool is structurally a bad target (mostly `not-json` = it emits
 text, not JSON) or just needs a lower size floor.
 
+#### Automating the evaluation (optional weekly cron)
+
+If you run Hermes Agent, you can have the analyzer run itself on a schedule and
+report verdicts instead of remembering to check. Drop a small wrapper in
+`~/.hermes/scripts/` that emits the JSON summary:
+
+```bash
+#!/bin/bash
+# ~/.hermes/scripts/headroom_shadow_weekly.sh
+exec "$HOME/.hermes/hermes-agent/venv/bin/python" \
+  "$HOME/.hermes/scripts/shadow_log_eval.py" \
+  --since 2026-06-21 --json     # set --since to when your shadow run started
+```
+
+Then create a cron job (e.g. Mondays 08:00) whose `script` is that wrapper and
+whose prompt asks the agent to turn the injected JSON into a short briefing —
+per-tool verdicts, which tools are ready to promote, and the likely reason for
+any SKIP/MARGINAL. The wrapper's stdout is fed to the job as context, so the
+agent only reasons over the compact summary, not the raw log. Keep the
+`--since` date aligned with the start of your shadow window so old lines don't
+skew the numbers.
+
 ## Install
 
 1. Dependency (bare, no ML extras — the JSON path is the Rust `_core.abi3.so`,
