@@ -35,12 +35,17 @@ def _clean_env(monkeypatch):
     for k in (
         "HERMES_HEADROOM_JSON_COMPRESS",
         "HEADROOM_COMPRESS_TOOLS",
+        "HEADROOM_COMPRESS_SHADOW_TOOLS",
         "HEADROOM_COMPRESS_MIN_BYTES",
         "HEADROOM_COMPRESS_LOG",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HERMES_HEADROOM_JSON_COMPRESS", "1")
     monkeypatch.setenv("HEADROOM_COMPRESS_MIN_BYTES", "200")
+    # The allow-list is empty by default now (a tool on no list is out of
+    # scope), so put search_files on the INJECT list for the gate tests that
+    # exercise the compression happy-path.
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "search_files")
 
 
 def _big_json_array(n=300):
@@ -195,27 +200,14 @@ def test_first_op_deterministic_in_subprocess():
 
 
 # --------------------------------------------------------------------------
-# Shadow mode — observe without injecting
+# Per-tool shadow (monitor) mode — observe without injecting
 # --------------------------------------------------------------------------
 
-def test_shadow_mode_never_injects(monkeypatch):
-    """Shadow mode runs the full pipeline but always returns None, even when
-    the result is perfectly compressible."""
-    monkeypatch.delenv("HERMES_HEADROOM_JSON_COMPRESS", raising=False)
-    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW", "1")
-    out = plugin.compress_tool_result(tool_name="search_files", result=_big_json_array())
-    assert out is None
-
-
-def test_shadow_runs_without_master_switch(monkeypatch):
-    """Shadow proceeds past the master-switch gate (the point is to observe
-    before enabling injection). We assert it reaches compression by checking
-    the logged decision is 'shadow-would-compress'."""
+def _capture_log():
+    """Return (handler, records_list) capturing the plugin logger's messages."""
     import logging
 
-    monkeypatch.delenv("HERMES_HEADROOM_JSON_COMPRESS", raising=False)
-    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW", "1")
-    records = []
+    records: list[str] = []
 
     class _Cap(logging.Handler):
         def emit(self, record):
@@ -224,29 +216,72 @@ def test_shadow_runs_without_master_switch(monkeypatch):
     h = _Cap()
     plugin.logger.addHandler(h)
     plugin.logger.setLevel(logging.INFO)
+    return h, records
+
+
+def test_shadow_tool_monitors_never_injects(monkeypatch):
+    """A tool on HEADROOM_COMPRESS_SHADOW_TOOLS runs the full pipeline but
+    always returns None, and logs 'shadow-would-compress' with a ratio."""
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "")  # nothing injecting
+    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW_TOOLS", "discord")
+    h, records = _capture_log()
     try:
-        out = plugin.compress_tool_result(tool_name="search_files", result=_big_json_array())
+        out = plugin.compress_tool_result(tool_name="discord", result=_big_json_array())
     finally:
         plugin.logger.removeHandler(h)
     assert out is None
     assert any("shadow-would-compress" in m for m in records), records
 
 
-def test_master_switch_wins_over_shadow(monkeypatch):
-    """If both are set, injection wins (master switch ON => real compression)."""
-    monkeypatch.setenv("HERMES_HEADROOM_JSON_COMPRESS", "1")
-    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW", "1")
-    out = plugin.compress_tool_result(tool_name="search_files", result=_big_json_array())
+def test_inject_tool_compresses(monkeypatch):
+    """A tool on HEADROOM_COMPRESS_TOOLS (and not shadowed) is injected."""
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "discord")
+    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW_TOOLS", "")
+    out = plugin.compress_tool_result(tool_name="discord", result=_big_json_array())
     assert isinstance(out, str)
     assert len(out) < len(_big_json_array())
 
 
-def test_shadow_still_respects_gates(monkeypatch):
-    """Shadow doesn't bypass the allow-list / JSON / size gates — non-allow-listed
-    tool returns None with no compression attempt."""
-    monkeypatch.delenv("HERMES_HEADROOM_JSON_COMPRESS", raising=False)
-    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW", "1")
+def test_shadow_wins_on_overlap(monkeypatch):
+    """A tool present in BOTH lists is monitored, never injected (shadow wins).
+    This is the safe promotion path — staged in shadow until removed from it."""
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "discord")
+    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW_TOOLS", "discord")
+    h, records = _capture_log()
+    try:
+        out = plugin.compress_tool_result(tool_name="discord", result=_big_json_array())
+    finally:
+        plugin.logger.removeHandler(h)
+    assert out is None, "shadow must win over inject when a tool is on both lists"
+    assert any("shadow-would-compress" in m for m in records), records
+
+
+def test_tool_on_neither_list_out_of_scope(monkeypatch):
+    """A tool on no list is untouched — no compression attempt."""
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "discord")
+    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW_TOOLS", "process")
     assert plugin.compress_tool_result(tool_name="web_extract", result=_big_json_array()) is None
+
+
+def test_master_switch_kills_monitoring(monkeypatch):
+    """The master kill-switch disables monitoring too — off => total no-op even
+    for a shadow-listed tool, with no log line emitted."""
+    monkeypatch.delenv("HERMES_HEADROOM_JSON_COMPRESS", raising=False)
+    monkeypatch.setenv("HEADROOM_COMPRESS_SHADOW_TOOLS", "discord")
+    h, records = _capture_log()
+    try:
+        out = plugin.compress_tool_result(tool_name="discord", result=_big_json_array())
+    finally:
+        plugin.logger.removeHandler(h)
+    assert out is None
+    assert records == [], f"master switch off must emit nothing, got: {records}"
+
+
+def test_master_switch_kills_injection(monkeypatch):
+    """The master kill-switch disables injection too — off => no compression."""
+    monkeypatch.delenv("HERMES_HEADROOM_JSON_COMPRESS", raising=False)
+    monkeypatch.setenv("HEADROOM_COMPRESS_TOOLS", "discord")
+    assert plugin.compress_tool_result(tool_name="discord", result=_big_json_array()) is None
 
 
 # --------------------------------------------------------------------------

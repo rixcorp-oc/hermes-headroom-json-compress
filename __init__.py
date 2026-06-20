@@ -21,23 +21,39 @@ Why a hook and not a core edit or a context engine?
     single-active ContextEngine slot (e.g. an LCM engine can run alongside).
 
 Safety posture — FAIL OPEN. Anything unexpected (non-str result, non-JSON,
-below size floor, tool not allow-listed, compression error, output not
-actually smaller) returns ``None`` => Hermes keeps the original result
-untouched. Compression can never corrupt or lose a tool result.
+below size floor, tool not in scope, compression error, output not actually
+smaller) returns ``None`` => Hermes keeps the original result untouched.
+Compression can never corrupt or lose a tool result.
 
-OFF by default. Enable with ``HERMES_HEADROOM_JSON_COMPRESS=1``.
+OFF by default. Enable the engine with ``HERMES_HEADROOM_JSON_COMPRESS=1``
+(a master kill-switch), then opt individual tools into one of two lists.
 
-Config (env):
-  HERMES_HEADROOM_JSON_COMPRESS   master switch (unset/0 => no-op)
-  HEADROOM_COMPRESS_SHADOW        "1" => compute + log the compression decision
-                                  but DO NOT replace the result (always return
-                                  None). Lets you observe ratios on real traffic
-                                  for days before flipping injection on. Implies
-                                  logging on. Overrides the master switch for the
-                                  injection decision (shadow never injects).
-  HEADROOM_COMPRESS_TOOLS         comma list of tool names (default: search_files)
+Two-list control model (per-tool):
+  * A tool in HEADROOM_COMPRESS_TOOLS         => INJECT  (replace with compressed)
+  * A tool in HEADROOM_COMPRESS_SHADOW_TOOLS  => MONITOR (compute + log the
+                                                 decision, but return None —
+                                                 never replace the result)
+  * A tool on NEITHER list                    => OUT OF SCOPE (untouched)
+  * A tool on BOTH lists                       => SHADOW WINS (monitor only).
+    This is the safe promotion path: stage a tool by adding it to
+    SHADOW_TOOLS, watch the logged ``shadow-would-compress ratio=`` lines on
+    real traffic, then promote it by moving it to TOOLS (remove from
+    SHADOW_TOOLS). You can't accidentally inject a tool you're still
+    observing.
+
+The master switch HERMES_HEADROOM_JSON_COMPRESS is a hard kill for BOTH
+paths: when it's unset/off, neither injection nor monitoring runs regardless
+of list contents (incident-disable without editing your tuned lists).
+
+Config (env, read fresh each call so flags can flip without restart):
+  HERMES_HEADROOM_JSON_COMPRESS   master kill-switch (unset/0 => total no-op)
+  HEADROOM_COMPRESS_TOOLS         comma list of tools to INJECT  (default: empty)
+  HEADROOM_COMPRESS_SHADOW_TOOLS  comma list of tools to MONITOR (default: empty)
   HEADROOM_COMPRESS_MIN_BYTES     size floor in bytes (default: 800)
-  HEADROOM_COMPRESS_LOG           "1" => emit a per-call decision line to the logger
+  HEADROOM_COMPRESS_LOG           "1" => emit a per-call decision line. Logging
+                                  is also forced on whenever any shadow tools
+                                  are configured (monitoring without a log is
+                                  pointless).
 
 Dependency: headroom-ai==0.26.0 (bare install, no ML extras). The JSON path
 loads only the Rust _core.abi3.so — zero torch/transformers.
@@ -52,8 +68,11 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default allow-list: start narrow with the biggest, cleanest structured win.
-_DEFAULT_TOOLS = "search_files"
+# No tool is in scope by default — both lists start empty. The master switch
+# plus explicit lists are the only control surface (a tool on no list is out
+# of scope).
+_DEFAULT_TOOLS = ""
+_DEFAULT_SHADOW_TOOLS = ""
 _DEFAULT_MIN_BYTES = 800
 
 # CCR (retrieval/cache markers) must be OFF — we want pure lossless table
@@ -107,37 +126,32 @@ def _ensure_headroom() -> bool:
 # --------------------------------------------------------------------------
 
 def _enabled() -> bool:
+    """Master kill-switch. When off, neither injection nor monitoring runs."""
     return os.environ.get("HERMES_HEADROOM_JSON_COMPRESS", "").lower() in {
         "1", "true", "yes", "on",
     }
 
 
-def _shadow_enabled() -> bool:
-    return os.environ.get("HEADROOM_COMPRESS_SHADOW", "").lower() in {
-        "1", "true", "yes", "on",
-    }
-
-
-def _log_enabled() -> bool:
-    # Shadow mode implies logging — observing without a log is pointless.
-    if _shadow_enabled():
-        return True
-    return os.environ.get("HEADROOM_COMPRESS_LOG", "").lower() in {
-        "1", "true", "yes", "on",
-    }
-
-
 def _allow_tools() -> frozenset[str]:
+    """Tools to INJECT (replace with compressed output)."""
     raw = os.environ.get("HEADROOM_COMPRESS_TOOLS", _DEFAULT_TOOLS)
     return frozenset(t.strip() for t in raw.split(",") if t.strip())
 
 
-def _min_bytes() -> int:
-    raw = os.environ.get("HEADROOM_COMPRESS_MIN_BYTES", "")
-    try:
-        return int(raw) if raw else _DEFAULT_MIN_BYTES
-    except ValueError:
-        return _DEFAULT_MIN_BYTES
+def _shadow_tools() -> frozenset[str]:
+    """Tools to MONITOR (compute + log, never replace). Shadow wins on overlap."""
+    raw = os.environ.get("HEADROOM_COMPRESS_SHADOW_TOOLS", _DEFAULT_SHADOW_TOOLS)
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
+
+
+def _log_enabled() -> bool:
+    # Any configured shadow tool implies logging — observing without a log is
+    # pointless.
+    if _shadow_tools():
+        return True
+    return os.environ.get("HEADROOM_COMPRESS_LOG", "").lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _log_decision(tool: str, orig: int, out: Optional[int], strategy: str, reason: str) -> None:
@@ -171,18 +185,29 @@ def compress_tool_result(
     Returns a compressed replacement string, or None to leave the result
     unchanged. Every guard returns None (fail open).
 
-    Shadow mode (HEADROOM_COMPRESS_SHADOW=1): the full gate + compress + log
-    pipeline runs, but the function ALWAYS returns None — it measures what
-    compression *would* do on real traffic without changing any result.
+    Per-tool control:
+      * tool in HEADROOM_COMPRESS_SHADOW_TOOLS => run the full gate + compress
+        + log pipeline but ALWAYS return None (monitor only). Shadow wins when
+        a tool appears in both lists.
+      * tool in HEADROOM_COMPRESS_TOOLS (and NOT in the shadow set) => inject
+        the compressed result.
+      * tool on neither list => out of scope, untouched.
+
+    The master switch HERMES_HEADROOM_JSON_COMPRESS is a hard kill for both
+    paths.
     """
-    # 1. Master switch. In shadow mode we proceed even when the master switch
-    #    is off (the point is to observe before enabling injection).
-    if not _enabled() and not _shadow_enabled():
+    # 1. Master kill-switch. Off => total no-op (no inject, no monitor).
+    if not _enabled():
         return None
 
-    # 2. Allow-list gate.
-    if tool_name not in _allow_tools():
+    # 2. Scope gate — the tool must be in at least one list.
+    inject_tools = _allow_tools()
+    shadow_tools = _shadow_tools()
+    if tool_name not in inject_tools and tool_name not in shadow_tools:
         return None
+
+    # Shadow wins on overlap: a tool in the shadow set only ever monitors.
+    is_shadow = tool_name in shadow_tools
 
     # 3. Type gate — only string results are compressible here.
     if not isinstance(result, str):
@@ -230,13 +255,21 @@ def compress_tool_result(
         _log_decision(tool_name, orig_len, len(compressed), strategy or "", "not-smaller")
         return None
 
-    # Shadow mode: log what we WOULD have done, but never inject.
-    if _shadow_enabled() and not _enabled():
+    # Shadow tool: log what we WOULD have done, but never inject.
+    if is_shadow:
         _log_decision(tool_name, orig_len, len(compressed), strategy or "", "shadow-would-compress")
         return None
 
     _log_decision(tool_name, orig_len, len(compressed), strategy or "", "ok")
     return compressed
+
+
+def _min_bytes() -> int:
+    raw = os.environ.get("HEADROOM_COMPRESS_MIN_BYTES", "")
+    try:
+        return int(raw) if raw else _DEFAULT_MIN_BYTES
+    except ValueError:
+        return _DEFAULT_MIN_BYTES
 
 
 def register(ctx) -> None:

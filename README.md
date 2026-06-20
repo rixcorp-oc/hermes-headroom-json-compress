@@ -16,7 +16,7 @@ caching intact.
 
 ## What it does
 
-When an allow-listed tool returns a JSON string above a size floor, the plugin
+When an in-scope tool returns a JSON string above a size floor, the plugin
 reformats it into Headroom's compact table-schema form (a header line declaring
 the columns + one row per record). Repeated keys and indentation are factored
 out; **no rows are dropped**. Typically ~55–73% byte reduction with 100% row
@@ -39,10 +39,65 @@ prompt caching is preserved.
 ## Safety: fail open
 
 Every guard returns `None` (= leave the result untouched). Non-string result,
-non-JSON, JSON scalar, below the size floor, tool not allow-listed, headroom
-unavailable, compression error, or output that isn't actually smaller → all
-pass the original result through unchanged. Compression can never corrupt or
-lose a tool result.
+non-JSON, JSON scalar, below the size floor, tool out of scope (on neither
+list), headroom unavailable, compression error, or output that isn't actually
+smaller → all pass the original result through unchanged. Compression can never
+corrupt or lose a tool result.
+
+## Configuration (env vars)
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `HERMES_HEADROOM_JSON_COMPRESS` | *(unset = OFF)* | Master kill-switch. Set `1` to arm the plugin. When off, **both** injection and monitoring are a total no-op regardless of list contents. |
+| `HEADROOM_COMPRESS_TOOLS` | *(empty)* | Comma-separated list of tools to **inject** (replace with compressed output). |
+| `HEADROOM_COMPRESS_SHADOW_TOOLS` | *(empty)* | Comma-separated list of tools to **monitor**: run the full gate + compress + log pipeline and emit `decision=shadow-would-compress ratio=…`, but never replace the result. Implies logging on. |
+| `HEADROOM_COMPRESS_MIN_BYTES` | `800` | Size floor; smaller results pass through. |
+| `HEADROOM_COMPRESS_LOG` | *(unset)* | `1` → emit a per-call decision line to the logger. (Forced on whenever any shadow tools are configured.) |
+
+### Per-tool two-list model
+
+A tool's behaviour is decided by which list it's on:
+
+- on `HEADROOM_COMPRESS_TOOLS` → **inject** (compressed result replaces the original)
+- on `HEADROOM_COMPRESS_SHADOW_TOOLS` → **monitor** (logged, never replaced)
+- on **both** → **shadow wins** (monitor only — you can't accidentally inject a tool you're still observing)
+- on **neither** → **out of scope** (untouched)
+
+**OFF by default** (both lists empty + master switch unset). Recommended rollout:
+
+1. **Arm + shadow:** set `HERMES_HEADROOM_JSON_COMPRESS=1` and add your
+   candidate tools to `HEADROOM_COMPRESS_SHADOW_TOOLS` (e.g.
+   `session_search,delegate_task,discord,process,todo`). The plugin logs
+   `decision=shadow-would-compress` lines with real ratios on live tool
+   output, but changes nothing. Watch for a few days.
+2. **Promote per tool:** for each tool clearing a worthwhile ratio, move it
+   from `HEADROOM_COMPRESS_SHADOW_TOOLS` into `HEADROOM_COMPRESS_TOOLS`. Since
+   shadow wins on overlap, you can leave it in both briefly and it stays in
+   monitor mode until you remove it from the shadow list.
+3. Keep the master switch as your one-line kill-switch for incidents.
+
+### Evaluating shadow output
+
+`scripts/shadow_log_eval.py` parses the plugin's decision lines out of the
+Hermes log and gives a per-tool verdict so you can decide what to promote:
+
+```
+python scripts/shadow_log_eval.py                 # scans ~/.hermes/logs/agent.log
+python scripts/shadow_log_eval.py --since 2026-06-21
+python scripts/shadow_log_eval.py --min-ratio 0.35 --min-hit-rate 0.6
+python scripts/shadow_log_eval.py --json          # machine-readable
+python scripts/shadow_log_eval.py --csv out.csv
+```
+
+It reports, per tool: in-scope calls, hit-rate (would-compress / in-scope
+calls), mean/median/p25-p75 compression ratio, total bytes saved, and a
+verdict (PROMOTE / MARGINAL / SKIP). Two thresholds drive the verdict — a
+minimum mean ratio (default 30%) AND a minimum hit-rate (default 50%) — so a
+tool whose output is only occasionally large JSON is flagged MARGINAL even if
+those rare hits compress well. A passthrough breakdown shows *why* calls
+didn't compress (`not-json`, `below-size-floor`, `not-smaller`), which tells
+you whether a tool is structurally a bad target (mostly `not-json` = it emits
+text, not JSON) or just needs a lower size floor.
 
 ## Install
 
@@ -64,26 +119,6 @@ lose a tool result.
 
    (Or wherever your Hermes install discovers plugins — see the Hermes docs.)
 
-## Configuration (env vars)
-
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `HERMES_HEADROOM_JSON_COMPRESS` | *(unset = OFF)* | Master switch. Set `1` to enable injection. |
-| `HEADROOM_COMPRESS_SHADOW` | *(unset)* | `1` → observe-only: run the full gate + compress + log pipeline but NEVER replace a result. Implies logging on. Use this on real traffic for a few days before enabling injection. |
-| `HEADROOM_COMPRESS_TOOLS` | `search_files` | Comma-separated allow-list of tool names. |
-| `HEADROOM_COMPRESS_MIN_BYTES` | `800` | Size floor; smaller results pass through. |
-| `HEADROOM_COMPRESS_LOG` | *(unset)* | `1` → emit a per-call decision line to the logger. |
-
-**OFF by default.** Recommended rollout:
-
-1. **Shadow run:** set `HEADROOM_COMPRESS_SHADOW=1` (leave the master switch
-   unset). The plugin logs `decision=shadow-would-compress` lines with real
-   ratios on live tool output, but changes nothing. Watch for a few days.
-2. **Enable injection:** set `HERMES_HEADROOM_JSON_COMPRESS=1` with the default
-   `search_files` allow-list (biggest, cleanest win). If both flags are set,
-   injection wins.
-3. Widen `HEADROOM_COMPRESS_TOOLS` as confidence grows. Keep the kill-switch.
-
 ## Tests
 
 ```
@@ -91,9 +126,10 @@ source .venv/bin/activate     # an env with headroom-ai==0.26.0 installed
 python -m pytest test_plugin.py -v
 ```
 
-18 tests: master switch, allow-list, type/JSON/size gates, row-losslessness,
-output-shrinks, shadow mode, cross-process determinism, and the `register()`
-contract.
+20 tests: master kill-switch (inject + monitor), per-tool inject/shadow lists,
+shadow-wins-on-overlap, out-of-scope passthrough, type/JSON/size gates,
+row-losslessness, output-shrinks, cross-process determinism, and the
+`register()` contract.
 
 ## Credits
 
