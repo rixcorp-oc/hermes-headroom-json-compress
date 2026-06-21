@@ -1,0 +1,31 @@
+# Runtime dependency for the headroom-windowed-ccr plugin.
+#
+# Same pin as headroom-json-compress. The log-compression path uses
+# headroom.compression.UniversalCompressor (content_type=LOG, ccr_enabled) and
+# headroom.cache.compression_store — both ship in this wheel. The JSON path's
+# bare-install property holds here too (no torch/transformers required for the
+# LOG entropy-preserving compressor + CCR store).
+#
+# PIN IS CACHE-AFFECTING: a version bump can change compressed bytes AND the
+# hash scheme, which breaks both prompt-cache prefix stability and any markers
+# minted under the old version. Treat any upgrade as a re-validation event —
+# re-run the windowed-CCR round-trip + RUN 4 eval before bumping.
+#
+# Hermes does NOT auto-install plugin requirements. Install manually into the
+# Hermes venv (which has no pip — use uv):
+#
+#     uv pip install --python /path/to/.hermes/hermes-agent/venv/bin/python -r requirements.txt
+#
+# Re-run this after any `hermes update` that rebuilds the venv.
+headroom-ai==0.26.0
+
+# LOG-PATH RUNTIME (REQUIRED for this plugin — unlike headroom-json-compress).
+# The JSON plugin's path is pure Rust (zero ML deps). This plugin's LOG path
+# uses Headroom's UniversalCompressor, whose Kompress backend requires
+# onnxruntime AND transformers (NOT torch) plus a one-time ~2MB
+# ModernBERT-base download into the HF cache on first compress. Without these
+# the compressor returns nothing and the plugin fails OPEN (passes everything
+# through, logs no shadow decisions). transformers resolves tokenizers to
+# <=0.22.x, which still satisfies litellm's tokenizers>=0.21,<1.0 pin.
+onnxruntime
+transformers
